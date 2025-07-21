@@ -14,7 +14,7 @@
 
 #define SERVER_TIMEOUT	30000	// how often keepalive gets sent
 #define INTERSERVER_TIMER					10000
-#define LoginServer_StatusUpdateInterval	15000
+#define LoginServer_StatusUpdateInterval	5000 
 #define LoginServer_AuthStale				60000
 #define AUTHCHANGE_TIMEOUT					900	// in seconds
 
@@ -182,6 +182,11 @@
 #define ServerOP_UpdateSchedulerEvents 0x4007
 #define ServerOP_UCSServerStatusRequest		0x4008
 #define ServerOP_UCSServerStatusReply		0x4009
+#define ServerOP_QueueAuthorization		0x4012
+#define ServerOP_QueueAutoConnect		0x4013
+#define ServerOP_QueuePositionQuery		0x4014	// Login->World: Request queue position for account
+#define ServerOP_QueuePositionResponse	0x4015	// World->Login: Reply with queue position
+#define ServerOP_QueueDirectUpdate		0x4016	// World->Login: Send pre-built server list packet to specific client
 
 #define ServerOP_ReloadAAData 0x4100
 #define ServerOP_ReloadBlockedSpells 0x4101
@@ -1299,6 +1304,39 @@ struct UCSServerStatus_Struct {
 struct ServerZoneDropClient_Struct
 {
 	uint32 lsid;
+};
+
+// Queue System Structures
+struct ServerQueueAuthorization_Struct {
+	uint32 account_id;
+	uint32 authorization_timestamp;  // When this authorization was granted
+	uint32 timeout_seconds;          // How long this authorization is valid (default: 300 = 5 minutes)
+};
+
+struct ServerQueueAutoConnect_Struct {
+	uint32 loginserver_account_id;
+	uint32 world_id;
+	uint32 from_id;
+	uint32 to_id;
+	uint32 ip_address;
+	char ip_addr_str[64];
+	char forum_name[31];
+};
+
+struct ServerQueuePositionQuery_Struct {
+	uint32 loginserver_account_id;  // Which account to query position for
+};
+
+struct ServerQueuePositionResponse_Struct {
+	uint32 loginserver_account_id;  // Account this response is for
+	uint32 queue_position;          // 0 = not queued, >0 = position in queue
+};
+
+struct ServerQueueDirectUpdate_Struct {
+	uint32 ls_account_id;       // Account identifier for lookup
+	uint32 ip_address;           
+	uint32 queue_position;      // New queue position (0 = not queued)
+	uint32 estimated_wait;      // Estimated wait time in seconds
 };
 
 #pragma pack()

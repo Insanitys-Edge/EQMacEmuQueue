@@ -62,6 +62,11 @@ public:
 	* Gets a client (if exists) by their account id.
 	*/
 	Client *GetClient(unsigned int account_id);
+	/**
+	 * Sends targeted server list updates to specific clients (for queue broadcasts).
+	 */
+	void SendTargetedQueueUpdates(const std::vector<std::pair<uint32, uint32>>& client_updates);
+	
 private:
 
 	/**

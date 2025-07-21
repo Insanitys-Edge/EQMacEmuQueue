@@ -31,6 +31,7 @@
 #include "zonelist.h"
 #include "clientlist.h"
 #include "wguild_mgr.h"
+#include "queue_manager.h"  // Add for QueueManager
 
 #include "../common/char_create_data.h"
 #include "../common/repositories/player_event_logs_repository.h"
@@ -74,6 +75,8 @@ extern EQ::Random emu_random;
 extern uint32 numclients;
 extern volatile bool RunLoops;
 extern volatile bool UCSServerAvailable_;
+extern uint32 numzones;
+extern QueueManager queue_manager;  // Global queue manager
 
 Client::Client(EQStreamInterface* ieqs)
 :	autobootup_timeout(RuleI(World, ZoneAutobootTimeoutMS)),
@@ -95,6 +98,7 @@ Client::Client(EQStreamInterface* ieqs)
 	char_id = 0;
 	zone_waiting_for_bootup = 0;
 	enter_world_triggered = false;
+	is_graceful_disconnect = false;  // Will be set to true for graceful 
 	m_ClientVersionBit = 0;
 	numclients++;
 	zoneGuildID = 0xFFFFFFFF;
@@ -105,6 +109,8 @@ Client::~Client() {
 		cle->SetOnline(CLE_Status::Offline);
 	}
 
+	// if (is_graceful_disconnect) {AccountTracker::Safe_RemoveReservation(cle->AccountID(), is_graceful_disconnect);} 
+	// ^ Commented out for now. This gives a grace period even if the client disconnects gracefully consistency.
 	numclients--;
 
 	//let the stream factory know were done with this stream
@@ -300,6 +306,13 @@ bool Client::HandleSendLoginInfoPacket(const EQApplicationPacket *app) {
 			SendExpansionInfo();
 			SendCharInfo();
 			database.LoginIP(cle->AccountID(), long2ip(GetIP()));
+			
+			// Register this account as active for queue population tracking
+			extern LoginServer* loginserver;
+			extern QueueManager queue_manager;
+			if (loginserver && queue_manager.m_account_rez_mgr) {
+				queue_manager.m_account_rez_mgr->AddRez(cle->AccountID(), GetIP());
+			}
 		}
 	}
 	else {
@@ -873,6 +886,7 @@ bool Client::HandlePacket(const EQApplicationPacket *app) {
 		}
 		case OP_WorldLogout:
 		{
+			is_graceful_disconnect = true;
 			eqs->Close();
 			return true;
 		}

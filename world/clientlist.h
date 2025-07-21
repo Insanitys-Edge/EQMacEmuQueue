@@ -77,6 +77,7 @@ public:
 
 
 	int GetClientCount();
+	int GetTotalClientCount();
 	void GetClients(const char *zone_name, std::vector<ClientListEntry *> &into);
 	bool WhoAllFilter(ClientListEntry* client, Who_All_Struct* whom, int16 admin, int whomlen);
 

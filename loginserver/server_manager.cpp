@@ -105,7 +105,7 @@ WorldServer* ServerManager::GetServerByAddress(const std::string& addr, int port
 	return nullptr;
 }
 
-EQApplicationPacket* ServerManager::CreateServerListPacket(Client* c)
+EQApplicationPacket* ServerManager::CreateServerListPacket(Client* c, uint32 queue_server_id, uint32 queue_position)
 {
 	unsigned int packet_size = sizeof(ServerList_Struct);
 	unsigned int server_count = 0;
@@ -190,7 +190,16 @@ EQApplicationPacket* ServerManager::CreateServerListPacket(Client* c)
 		}
 		slsf->flags = 0x1;
 		slsf->worldid = (*iter)->GetServerId();
-		slsf->usercount = (*iter)->GetStatus();
+		
+		// Check if this server should show queue position instead of normal population
+		if (queue_server_id != 0 && (*iter)->GetServerId() == queue_server_id) {
+			slsf->usercount = queue_position;
+			LogInfo("DEBUG: Server [{}] (ID: {}) showing queue position [{}] instead of population", 
+				(*iter)->GetServerLongName(), (*iter)->GetServerId(), queue_position);
+		} else {
+			slsf->usercount = (*iter)->GetStatus();
+		}
+		
 		data_ptr += sizeof(ServerListServerFlags_Struct);
 		++iter;
 	}
@@ -199,7 +208,7 @@ EQApplicationPacket* ServerManager::CreateServerListPacket(Client* c)
 	return outapp;
 }
 
-void ServerManager::SendUserToWorldRequest(const char* server_id, unsigned int client_account_id, uint32 ip)
+void ServerManager::SendUserToWorldRequest(const char* server_id, unsigned int client_account_id, uint32 ip, bool is_auto_connect)
 {
 	auto iter = m_world_servers.begin();
 	bool found = false;
@@ -214,6 +223,12 @@ void ServerManager::SendUserToWorldRequest(const char* server_id, unsigned int c
 
 			utwr->lsaccountid = client_account_id;
 			utwr->ip = ip;
+			
+			// Encode auto-connect status in FromID field
+			// 0 = manual PLAY request, 1 = auto-connect request  
+			utwr->FromID = is_auto_connect ? 1 : 0;
+			utwr->ToID = 0; // Not used
+			
 			(*iter)->GetConnection()->Send(ServerOP_UsertoWorldReq, outapp);
 			found = true;
 

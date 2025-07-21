@@ -163,3 +163,40 @@ Client *ClientManager::GetClient(unsigned int account_id)
 	return cur;
 }
 
+void ClientManager::SendTargetedQueueUpdates(const std::vector<std::pair<uint32, uint32>>& client_updates)
+{
+	if (client_updates.empty()) {
+		return;
+	}
+	
+	uint32 updates_sent = 0;
+	
+	for (const auto& update : client_updates) {
+		uint32 ip_address = update.first;
+		uint32 ls_account_id = update.second;
+		
+		Client* target_client = nullptr;
+		
+		if (!target_client && ls_account_id != 0) {
+			target_client = GetClient(ls_account_id);
+		}
+		
+		if (target_client) {
+			target_client->SendServerListPacket();
+			updates_sent++;
+			
+			in_addr addr;
+			addr.s_addr = ip_address;
+			LogDebug("Sent targeted server list update to client IP [{}] LS [{}]", 
+				inet_ntoa(addr), ls_account_id);
+		} else {
+			in_addr addr;
+			addr.s_addr = ip_address;
+			LogDebug("Could not find client for targeted update: IP [{}] LS [{}]", 
+				inet_ntoa(addr), ls_account_id);
+		}
+	}
+	
+	LogInfo("Sent [{}] targeted queue updates out of [{}] requested", updates_sent, client_updates.size());
+}
+

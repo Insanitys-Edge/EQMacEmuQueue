@@ -22,6 +22,7 @@
 #include "zonelist.h"
 #include "client.h"
 #include "worlddb.h"
+#include "login_server.h"
 #include "../common/strings.h"
 #include "../common/guilds.h"
 #include "../common/races.h"
@@ -69,7 +70,10 @@ void ClientList::Process() {
 			in.s_addr = iterator.GetData()->GetIP();
 			LogInfo("Removing client from [{}]:[{}]", inet_ntoa(in), iterator.GetData()->GetPort());
 			uint32 accountid = iterator.GetData()->GetAccountID();
+			uint32 client_ip = iterator.GetData()->GetIP();
 			iterator.RemoveCurrent();
+
+			// Let automatic cleanup handle IP reservation removal
 
 			if (!ActiveConnection(accountid))
 			{
@@ -547,7 +551,11 @@ void ClientList::CLCheckStale() {
 			in.s_addr = iterator.GetData()->GetIP();
 			LogInfo("Removing stale client on account [{}] from [{}]", iterator.GetData()->AccountID(), inet_ntoa(in));
 			uint32 accountid = iterator.GetData()->AccountID();
+			uint32 client_ip = iterator.GetData()->GetIP();
 			iterator.RemoveCurrent();
+			
+			// Let automatic cleanup handle IP reservation removal
+
 			if (!ActiveConnection(accountid))
 			{
 				if(should_remove_playercount)
@@ -1502,6 +1510,18 @@ bool ClientList::IsAccountInGame(uint32 iLSID) {
 
 int ClientList::GetClientCount() {
 	return(numplayers);
+}
+
+int ClientList::GetTotalClientCount() {
+	// Count all client list entries including GMs for accurate population tracking
+	int total_count = 0;
+	LinkedListIterator<ClientListEntry*> iterator(clientlist);
+	iterator.Reset();
+	while (iterator.MoreElements()) {
+		total_count++;
+		iterator.Advance();
+	}
+	return total_count;
 }
 
 void ClientList::GetClients(const char *zone_name, std::vector<ClientListEntry *> &res) {

@@ -22,6 +22,8 @@
 #include <iomanip>
 #include <stdlib.h>
 #include <unordered_set>
+#include <algorithm>
+#include <vector>
 
 #include "../common/version.h"
 #include "../common/servertalk.h"
@@ -38,6 +40,7 @@
 #include "clientlist.h"
 #include "cliententry.h"
 #include "world_config.h"
+#include "queue_manager.h"
 #include <mutex>
 extern ZSList        zoneserver_list;
 extern ClientList    client_list;
@@ -46,6 +49,10 @@ extern uint32        numplayers;
 extern volatile bool RunLoops;
 extern std::mutex ipMutex;
 extern std::unordered_set<uint32> ipWhitelist;
+extern QueueManager queue_manager;  // Global queue manager
+
+// Global pointer for other files to access the primary LoginServer instance
+LoginServer* loginserver = nullptr;
 
 LoginServer::LoginServer(const char* iAddress, uint16 iPort, const char* Account, const char* Password, uint8 Type)
 {
@@ -55,21 +62,41 @@ LoginServer::LoginServer(const char* iAddress, uint16 iPort, const char* Account
 	m_login_password = Password;
 	m_can_account_update = false;
 	m_is_legacy = Type == 1;
+	
+	// Set global pointer to first LoginServer instance for other files to access
+	if (!loginserver) {
+		loginserver = this;
+	}
+	
 	Connect();
 }
 
 LoginServer::~LoginServer() {
-
+	// Clear global pointer if it was pointing to this instance
+	if (loginserver == this) {
+		loginserver = nullptr;
+	}
 }
 
 void LoginServer::ProcessUsertoWorldReq(uint16_t opcode, EQ::Net::Packet& p)
 {
 	const WorldConfig* Config = WorldConfig::get();
 	LogNetcode("Received ServerPacket from LS OpCode {:#04x}", opcode);
+	
+	LogInfo("DEBUG: ProcessUsertoWorldReq called - checking if queue logic is triggered");
 
 	UsertoWorldRequest* utwr = (UsertoWorldRequest*)p.Data();
 	uint32                     id = database.GetAccountIDFromLSID(utwr->lsaccountid);
 	int16                      status = database.CheckStatus(id);
+	
+	// Handle new accounts that don't have world accounts yet
+	if (id == 0) {
+		LogInfo("DEBUG: No world account found for LS account [{}] - will be created during authentication", utwr->lsaccountid);
+		// For queue purposes, we'll use the LS account ID temporarily
+		// The actual world account will be created during the authentication process
+		id = utwr->lsaccountid;  // Temporary fallback for new accounts
+		status = 0; // Default status for new accounts
+	}
 	
 	bool mule = false;
 	uint16 expansion = 0;
@@ -95,50 +122,125 @@ void LoginServer::ProcessUsertoWorldReq(uint16_t opcode, EQ::Net::Packet& p)
 	else {
 		utwrs->response = 1;
 	}
-
-	int32 x = Config->MaxClients;
-	if ((int32)numplayers >= x && x != -1 && x != 255 && status < 80)
-		utwrs->response = -3;
-
-	if (status == -1)
+	if (status == -1) // Suspended
 		utwrs->response = -1;
-	if (status == -2)
+	if (status == -2) // Banned
 		utwrs->response = -2;
 
 	if (utwrs->response == 1)
 	{
-		// active account checks
+		// Active account?
 		if (RuleI(World, AccountSessionLimit) >= 0 && status < (RuleI(World, ExemptAccountLimitStatus)) && (RuleI(World, ExemptAccountLimitStatus) != -1) && client_list.CheckAccountActive(id))
 			utwrs->response = -4;
 	}
 	if (utwrs->response == 1)
 	{
-		// ip limit checks
+		// Client IP limit?
 		if (!mule && RuleI(World, MaxClientsPerIP) >= 0 && !client_list.CheckIPLimit(id, utwr->ip, status))
 			utwrs->response = -5;
 	}
 
 	if (utwrs->response == 1)
 	{
-		// ip limit checks
+		// Mule IP limit?
 		if (mule && RuleI(World, MaxMulesPerIP) >= 0 && !client_list.CheckMuleLimit(id, utwr->ip, status))
 			utwrs->response = -5;
 	}
 
-	if (client_list.GetClientCount() /* + client_queue.Count()*/ >= RuleI(Quarm, PlayerPopulationCap) && status == 0)
-	{
-		utwrs->response = -6; // Queue player, don't allow entry
-		//We should really tell the WorldServer how much players are remaining in queue to determine this, but we can make that a world <-> login communication
-		//TODO: Implement queue logic
+	// Check if queue bypass is enabled for certain accounts
+	bool has_authorization = false;
+	bool auto_connect = false;
+	
+	// Correct auto-connect detection: FromID = 1 means auto-connect, FromID = 0 means manual PLAY
+	if (utwr->FromID == 1) {
+		auto_connect = true;
+		LogInfo("DEBUG: Auto-connect request detected from LS account [{}]", utwr->lsaccountid);
+	} else {
+		LogInfo("DEBUG: Manual PLAY request from LS account [{}]", utwr->lsaccountid);
+	}
+	
+	// Check for queue authorization tokens (simple existence check for now)
+	if (!has_authorization && RuleB(World, EnableQueue)) {
+		if (auto_connect) {
+			has_authorization = true;
+			LogInfo("DEBUG: Auto-connect request has implicit authorization");
+		}
+	}
+	
+	// Get queue capacity from rules
+	uint32 queue_cap = RuleI(Quarm, PlayerPopulationCap);
+	
+	// Check if queue system is disabled via rules
+	if (!RuleB(World, EnableQueue)) {
+		LogInfo("DEBUG: Queue system disabled via rules - allowing all connections");
+		// Queue system disabled, allow all connections regardless of capacity
+		// utwrs->response already set to 1 above
+	}
+	else {
+		// CENTRALIZED QUEUE DECISION: Use EvaluateConnectionRequest for ALL queue logic
+		uint32 effective_population = queue_manager.GetEffectivePopulation();
+		
+		LogInfo("DEBUG: Capacity check: {} >= {} (authorization: {})", 
+			effective_population, queue_cap, has_authorization ? "yes" : "no");
+		
+		// At capacity check - use centralized decision logic
+		if (effective_population >= queue_cap && !has_authorization) {
+			LogInfo("DEBUG: SERVER AT CAPACITY - using centralized queue decision logic");
+			
+			// QUEUE TOGGLE PRE-CHECK: Handle players clicking PLAY while already queued
+			if (!auto_connect && queue_manager.IsAccountQueued(id)) {
+				LogInfo("QUEUE TOGGLE: Player [{}] clicked PLAY while queued - removing from queue and staying on server select", id);
+				queue_manager.RemoveFromQueue(id);
+				// Send special response code for queue toggle that login server will handle by returning early
+				utwrs->response = -7; // Special queue toggle response code
+				LogInfo("DEBUG: Queue toggle - player removed from queue, sending -7 response for clean server select stay");
+			} else {
+				// Build connection request for centralized evaluation
+				ConnectionRequest request = {};
+				request.account_id = id;                    // world account ID
+				request.ls_account_id = utwr->lsaccountid; // login server account ID
+				request.ip_address = utwr->ip;
+				request.status = status;                    // GM level for bypass checks
+				request.is_auto_connect = auto_connect;    // Auto-connect vs manual PLAY
+				request.is_mule = mule;
+				request.ip_str = inet_ntoa(*(struct in_addr*)&utwr->ip);
+				request.forum_name = utwr->forum_name;
+				request.world_account_id = id;
+				
+				// CENTRALIZED DECISION: Let queue manager handle ALL queue logic
+				bool should_override_capacity = queue_manager.EvaluateConnectionRequest(request, queue_cap, utwrs, nullptr);
+				
+				if (should_override_capacity) {
+					LogInfo("DEBUG: Queue manager APPROVED bypass for account [{}] - allowing connection", id);
+					// Connection approved by queue manager - allow through
+				} else {
+					LogInfo("DEBUG: Queue manager QUEUED account [{}] - returning -6", id);
+					utwrs->response = -6;
+					// Queue manager already handled adding to queue in EvaluateConnectionRequest
+				}
+			}
+		} else if (has_authorization) {
+			LogInfo("DEBUG: Account [{}] used queue authorization to bypass capacity check", id);
+		} else {
+			LogInfo("DEBUG: Server NOT at capacity - allowing connection (pop: {}/{})", effective_population, queue_cap);
+		}
+	}
+	
+	// Only add to IP whitelist and log success if connection is actually allowed
+	if (utwrs->response == 1) {
+		LogInfo("DEBUG: Connection approved - adding IP to whitelist");
+		ipMutex.lock();
+		ipWhitelist.insert(utwr->ip);
+		ipMutex.unlock();
+	} else {
+		LogInfo("DEBUG: Connection not approved (response: {}) - not adding to whitelist", utwrs->response);
 	}
 
-	ipMutex.lock();
-	ipWhitelist.insert(utwr->ip);
-	ipMutex.unlock();
-				
-
 	utwrs->worldid = utwr->worldid;
+	
+	LogInfo("DEBUG: About to send response [{}] to login server for LS account [{}]", utwrs->response, utwr->lsaccountid);
 	SendPacket(outpack);
+	LogInfo("DEBUG: Response packet sent successfully");
 	delete outpack;
 }
 
@@ -192,6 +294,103 @@ void LoginServer::ProcessLSAccountUpdate(uint16_t opcode, EQ::Net::Packet& p) {
 	m_can_account_update = true;
 }
 
+void LoginServer::ProcessQueueAuthorization(uint16_t opcode, EQ::Net::Packet& p) {
+	LogNetcode("Received ServerPacket from LS OpCode {:#04x}", opcode);
+
+	if (p.Length() < sizeof(ServerQueueAuthorization_Struct)) {
+		LogError("Received ServerOP_QueueAuthorization packet that was too small");
+		return;
+	}
+
+	ServerQueueAuthorization_Struct* sqas = (ServerQueueAuthorization_Struct*)p.Data();
+	
+	// Remove any existing authorization for this account
+	auto it = std::remove_if(m_authorized_accounts.begin(), m_authorized_accounts.end(),
+		[sqas](const QueueAuthorization& auth) {
+			return auth.account_id == sqas->account_id;
+		});
+	m_authorized_accounts.erase(it, m_authorized_accounts.end());
+	
+	// Add new authorization
+	m_authorized_accounts.emplace_back(sqas->account_id, sqas->authorization_timestamp, sqas->timeout_seconds);
+	
+	LogInfo("Received queue authorization for account [{}] - valid for [{}] seconds", 
+		sqas->account_id, sqas->timeout_seconds);
+}
+
+void LoginServer::ProcessQueuePositionQuery(uint16_t opcode, EQ::Net::Packet& p) {
+	LogNetcode("Received ServerPacket from LS OpCode {:#04x}", opcode);
+
+	if (p.Length() < sizeof(ServerQueuePositionQuery_Struct)) {
+		LogError("Received ServerOP_QueuePositionQuery packet that was too small");
+		return;
+	}
+	if (!RuleB(World, EnableQueue)) {
+		// LogError("Queue system is disabled - ignoring queue position query");
+		return;
+	}
+
+	ServerQueuePositionQuery_Struct* query = (ServerQueuePositionQuery_Struct*)p.Data();
+	
+	// Get queue position from queue manager
+	uint32 position = queue_manager.GetQueuePosition(query->loginserver_account_id);
+	
+	// Send response back to login server
+	auto response_pack = new ServerPacket(ServerOP_QueuePositionResponse, sizeof(ServerQueuePositionResponse_Struct));
+	ServerQueuePositionResponse_Struct* response = (ServerQueuePositionResponse_Struct*)response_pack->pBuffer;
+	response->loginserver_account_id = query->loginserver_account_id;
+	response->queue_position = position;
+	
+	SendPacket(response_pack);
+	delete response_pack;
+	
+	LogDebug("Queue position query: Account [{}] = Position [{}]", query->loginserver_account_id, position);
+}
+
+uint32 LoginServer::CalculateSmartWaitTime(uint32 queue_position, uint32 current_population, uint32 max_capacity) const
+{
+	// Base calculation: 60 seconds per position (fallback)
+	uint32 base_wait = queue_position * 60;
+	
+	// Calculate server utilization percentage (0-100)
+	uint32 utilization_percent = (current_population * 100) / max_capacity;
+	
+	// Adjust wait time based on how full the server is
+	float capacity_multiplier = 1.0f;
+	if (utilization_percent >= 95) {
+		// Server is nearly full - slower movement
+		capacity_multiplier = 1.8f;  // 80% longer wait
+	} else if (utilization_percent >= 90) {
+		// Server is very full - moderately slower
+		capacity_multiplier = 1.4f;  // 40% longer wait
+	} else if (utilization_percent >= 80) {
+		// Server is quite full - slightly slower  
+		capacity_multiplier = 1.2f;  // 20% longer wait
+	} else {
+		// Server has room - normal or faster movement
+		capacity_multiplier = 0.8f;  // 20% shorter wait
+	}
+	
+	// Apply queue position scaling (larger queues move more slowly)
+	float queue_scale = 1.0f;
+	if (queue_position > 50) {
+		queue_scale = 1.3f;  // Large queue penalty
+	} else if (queue_position > 20) {
+		queue_scale = 1.1f;  // Medium queue penalty  
+	}
+	
+	// Calculate final wait time with bounds checking
+	uint32 smart_wait = (uint32)(base_wait * capacity_multiplier * queue_scale);
+	
+	// Reasonable bounds: minimum 30 seconds, maximum 20 minutes per position
+	uint32 min_wait = queue_position * 30;
+	uint32 max_wait = queue_position * 1200; // 20 minutes max per position
+	
+	smart_wait = std::max(min_wait, std::min(smart_wait, max_wait));
+	
+	return smart_wait;
+}
+
 bool LoginServer::Connect() {
 
 	char errbuf[1024];
@@ -243,6 +442,8 @@ bool LoginServer::Connect() {
 		m_legacy_client->OnMessage(ServerOP_SystemwideMessage, std::bind(&LoginServer::ProcessSystemwideMessage, this, std::placeholders::_1, std::placeholders::_2));
 		m_legacy_client->OnMessage(ServerOP_LSRemoteAddr, std::bind(&LoginServer::ProcessLSRemoteAddr, this, std::placeholders::_1, std::placeholders::_2));
 		m_legacy_client->OnMessage(ServerOP_LSAccountUpdate, std::bind(&LoginServer::ProcessLSAccountUpdate, this, std::placeholders::_1, std::placeholders::_2));
+		m_legacy_client->OnMessage(ServerOP_QueueAuthorization, std::bind(&LoginServer::ProcessQueueAuthorization, this, std::placeholders::_1, std::placeholders::_2));
+		m_legacy_client->OnMessage(ServerOP_QueuePositionQuery, std::bind(&LoginServer::ProcessQueuePositionQuery, this, std::placeholders::_1, std::placeholders::_2));
 	}
 	else {
 		m_client.reset(new EQ::Net::ServertalkClient(m_loginserver_address, m_loginserver_port, false, "World", ""));
@@ -268,6 +469,8 @@ bool LoginServer::Connect() {
 		m_client->OnMessage(ServerOP_SystemwideMessage, std::bind(&LoginServer::ProcessSystemwideMessage, this, std::placeholders::_1, std::placeholders::_2));
 		m_client->OnMessage(ServerOP_LSRemoteAddr, std::bind(&LoginServer::ProcessLSRemoteAddr, this, std::placeholders::_1, std::placeholders::_2));
 		m_client->OnMessage(ServerOP_LSAccountUpdate, std::bind(&LoginServer::ProcessLSAccountUpdate, this, std::placeholders::_1, std::placeholders::_2));
+		m_client->OnMessage(ServerOP_QueueAuthorization, std::bind(&LoginServer::ProcessQueueAuthorization, this, std::placeholders::_1, std::placeholders::_2));
+		m_client->OnMessage(ServerOP_QueuePositionQuery, std::bind(&LoginServer::ProcessQueuePositionQuery, this, std::placeholders::_1, std::placeholders::_2));
 	}
 	return true;
 }
@@ -324,6 +527,10 @@ void LoginServer::SendNewInfo() {
 }
 
 void LoginServer::SendStatus() {
+	static uint32 last_call_time = 0;
+	static uint32 last_sent_population = 0;
+	uint32 current_time = time(nullptr);
+	
 	auto pack = new ServerPacket;
 	pack->opcode = ServerOP_LSStatus;
 	pack->size = sizeof(ServerLSStatus_Struct);
@@ -331,17 +538,27 @@ void LoginServer::SendStatus() {
 	memset(pack->pBuffer, 0, pack->size);
 	ServerLSStatus_Struct* lss = (ServerLSStatus_Struct*)pack->pBuffer;
 
+	uint32 effective_population = queue_manager.GetEffectivePopulation();
+	
+	LogInfo("DEBUG: SendStatus called - population: {} (last: {}), interval: {}s", 
+		effective_population, last_sent_population, 
+		last_call_time > 0 ? (current_time - last_call_time) : 0);
+	
 	if (WorldConfig::get()->Locked)
 		lss->status = -2;
 	else if (numzones <= 0)
 		lss->status = -1;
 	else
-		lss->status = numplayers > 0 ? numplayers : 0;
+		lss->status = effective_population > 0 ? effective_population : 0;
 
 	lss->num_zones = numzones;
-	lss->num_players = numplayers;
+	lss->num_players = effective_population;
+	
 	SendPacket(pack);
 	delete pack;
+	
+	last_call_time = current_time;
+	last_sent_population = effective_population;
 }
 
 void LoginServer::SendPacket(ServerPacket* pack)
@@ -369,3 +586,4 @@ void LoginServer::SendAccountUpdate(ServerPacket* pack)
 		SendPacket(pack);
 	}
 }
+

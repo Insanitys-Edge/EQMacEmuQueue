@@ -20,6 +20,10 @@
 #include "login_types.h"
 #include "../common/eqemu_logsys.h"
 #include "../common/ip_util.h"
+#include <fmt/format.h>
+#include <arpa/inet.h>
+#include <vector>
+#include <tuple>
 
 extern EQEmuLogSys LogSys;
 extern LoginServer server;
@@ -41,6 +45,10 @@ WorldServer::WorldServer(std::shared_ptr<EQ::Net::ServertalkServerConnection> c)
 	c->OnMessage(ServerOP_LSStatus, std::bind(&WorldServer::ProcessLSStatus, this, std::placeholders::_1, std::placeholders::_2));
 	c->OnMessage(ServerOP_UsertoWorldResp, std::bind(&WorldServer::ProcessUsertoWorldResp, this, std::placeholders::_1, std::placeholders::_2));
 	c->OnMessage(ServerOP_LSAccountUpdate, std::bind(&WorldServer::ProcessLSAccountUpdate, this, std::placeholders::_1, std::placeholders::_2));
+	c->OnMessage(ServerOP_QueuePositionResponse, std::bind(&WorldServer::ProcessQueuePositionResponse, this, std::placeholders::_1, std::placeholders::_2));
+	c->OnMessage(ServerOP_QueueAutoConnect, std::bind(&WorldServer::ProcessQueueAutoConnect, this, std::placeholders::_1, std::placeholders::_2));
+	c->OnMessage(ServerOP_QueueDirectUpdate, std::bind(&WorldServer::ProcessQueueDirectUpdate, this, std::placeholders::_1, std::placeholders::_2));
+	c->OnMessage(ServerOP_WorldListUpdate, std::bind(&WorldServer::ProcessWorldListUpdate, this, std::placeholders::_1, std::placeholders::_2));
 }
 
 WorldServer::~WorldServer()
@@ -105,6 +113,7 @@ void WorldServer::ProcessUsertoWorldResp(uint16_t opcode, const EQ::Net::Packet&
 	LogInfo("User-To-World Response received.");
 
 	UsertoWorldResponse*user_to_world_response = (UsertoWorldResponse*)p.Data();
+	LogInfo("DEBUG: Received response [{}] for LS account [{}]", user_to_world_response->response, user_to_world_response->lsaccountid);
 	LogInfo("Trying to find client with user id of [{0}].", user_to_world_response->lsaccountid);
 	Client* c = server.client_manager->GetClient(user_to_world_response->lsaccountid);
 	if (c && (c->GetClientVersion() == cv_old))
@@ -143,6 +152,21 @@ void WorldServer::ProcessUsertoWorldResp(uint16_t opcode, const EQ::Net::Packet&
 		case UserToWorldStatusIPLimitExceeded: {
 			c->FatalError("Error IP Limit Exceeded: \n\nYou have exceeded the maximum number of allowed IP addresses for this account.");
 			break;
+		}
+		case -6: { // Queue response - player should be queued
+		
+			LogInfo("QUEUE RESPONSE: Player [{}] should be queued by world server", user_to_world_response->lsaccountid);
+			// World server handles queue addition - login server just acknowledges
+			// Client will see updated queue position via ServerOP_QueueDirectUpdate packets
+			// For old clients, don't send any response - they'll stay on server select
+			// and see queue updates via server list refreshes
+			return; // Return early - no play response sent = "nothing happens" = stay on server select
+		}
+		case -7: { // Queue toggle - player removed from queue, stay on server select
+			LogInfo("QUEUE TOGGLE: Player [{}] removed from queue - staying on server select", user_to_world_response->lsaccountid);
+			// Player was removed from queue, no action needed
+			// Return early without sending play response - client stays on server select cleanly
+			return; // Return early - no play response sent = stay on server select
 		}
 		}
 		LogInfo("Found client with user id of {0} and account name of {1}.", user_to_world_response->lsaccountid, c->GetAccountName().c_str());
@@ -198,12 +222,30 @@ void WorldServer::ProcessUsertoWorldResp(uint16_t opcode, const EQ::Net::Packet&
 			per->Message = LS::ErrStr::IP_ADDR_MAX;
 			break;
 		}
+		case -6: { // Queue response - player should be queued
+			// Don't set per->Allowed = 1 - player shouldn't connect yet
+			per->Message = 0; // No error message needed - queue handled via server list
+			LogInfo("QUEUE RESPONSE: Player [{}] should be queued by world server", user_to_world_response->lsaccountid);
+			// World server handles queue addition - login server just acknowledges
+			// Client will see updated queue position via ServerOP_QueueDirectUpdate packets
+			// Send response with Allowed = 0 to keep client on server select
+			// break;
+			return;
+		}
+		case -7: { // Queue toggle - player removed from queue, stay on server select
+			// Don't set per->Allowed = 1 - player shouldn't connect yet
+			per->Message = 0; // No error message needed - same as queue response
+			LogInfo("QUEUE TOGGLE: Player [{}] removed from queue - staying on server select", user_to_world_response->lsaccountid);
+			// Player was removed from queue, no action needed
+			// Return early without sending play response - client stays on server select cleanly
+			return; // Return early - no play response sent = stay on server select
+		}
 		}
 
 		LogInfo("Sending play response with following data, allowed {} , sequence {} , server number {} , message {} ",
 			per->Allowed, per->Sequence, per->ServerNumber, per->Message);
 
-		c->SendPlayResponse(outapp);
+			c->SendPlayResponse(outapp);
 		delete outapp;
 	}
 	else {
@@ -504,4 +546,162 @@ void WorldServer::SendClientAuth(std::string ip, std::string account, std::strin
 	);
 
 	safe_delete(outapp);
+}
+// Queue position query methods for immediate push updates (no cache)
+void WorldServer::QueryQueuePosition(uint32 ls_account_id)
+{
+	// Send async query to world server for immediate push response
+	auto query_pack = new ServerPacket(ServerOP_QueuePositionQuery, sizeof(ServerQueuePositionQuery_Struct));
+	ServerQueuePositionQuery_Struct* query = (ServerQueuePositionQuery_Struct*)query_pack->pBuffer;
+	query->loginserver_account_id = ls_account_id;
+	
+	m_connection->SendPacket(query_pack);
+	delete query_pack;
+	
+	LogDebug("Sent queue position query for immediate push to account [{}]", ls_account_id);
+}
+
+void WorldServer::ProcessQueuePositionResponse(uint16_t opcode, const EQ::Net::Packet& p)
+{
+	if (p.Length() < sizeof(ServerQueuePositionResponse_Struct)) {
+		LogError("Received ServerOP_QueuePositionResponse packet that was too small");
+		return;
+	}
+
+	ServerQueuePositionResponse_Struct* response = (ServerQueuePositionResponse_Struct*)p.Data();
+	
+	// IMMEDIATE TARGETED PUSH: Send updated server list directly to the requesting client
+	if (server.client_manager) {
+		auto* client = server.client_manager->GetClient(response->loginserver_account_id);
+		if (client) {
+			// Send targeted server list update showing queue position
+			client->SendServerListPacket();
+			LogDebug("Sent immediate server list push to account [{}] showing queue position [{}]", 
+				response->loginserver_account_id, response->queue_position);
+		} else {
+			LogDebug("Client [{}] no longer connected when queue position response received", 
+				response->loginserver_account_id);
+		}
+	}
+}
+
+void WorldServer::ProcessQueueDirectUpdate(uint16_t opcode, const EQ::Net::Packet& p)
+{
+	LogInfo("DEBUG: ProcessQueueDirectUpdate called with opcode 0x{:X}, packet size {}", opcode, p.Length());
+	
+	if (p.Length() < sizeof(ServerQueueDirectUpdate_Struct)) {
+		LogError("Received ServerOP_QueueDirectUpdate packet that was too small");
+		return;
+	}
+
+	ServerQueueDirectUpdate_Struct* direct_update = (ServerQueueDirectUpdate_Struct*)p.Data();
+	
+	LogInfo("DEBUG: Received queue direct update for LS account [{}] position [{}] wait [{}]s", 
+		direct_update->ls_account_id, direct_update->queue_position, direct_update->estimated_wait);
+	
+	// Find target client by account ID only - no fallbacks
+	Client* target_client = nullptr;
+	
+	if (server.client_manager && direct_update->ls_account_id != 0) {
+		target_client = server.client_manager->GetClient(direct_update->ls_account_id);
+	}
+	
+	if (target_client) {
+		// Check if player is no longer queued (position 0 = removed from queue)
+		if (direct_update->queue_position == 0) {
+			LogInfo("DEBUG: Player [{}] no longer queued - sending normal server list", 
+				direct_update->ls_account_id);
+			
+			// Send normal server list without queue position override
+			target_client->SendServerListPacket();
+			LogInfo("DEBUG: Sent normal server list to player who left queue");
+		} else {
+			LogInfo("DEBUG: Found target client for LS account [{}] - creating custom server list with queue info", 
+				direct_update->ls_account_id);
+			
+			// Create custom server list packet with queue position information
+			// Use the optional queue parameters to override population display
+			EQApplicationPacket* server_list_packet = server.server_manager->CreateServerListPacket(
+				target_client, GetServerId(), direct_update->queue_position);
+			
+			if (server_list_packet) {
+				// Send the packet with queue position displayed as population
+				target_client->GetConnection()->QueuePacket(server_list_packet);
+				delete server_list_packet;
+				LogInfo("DEBUG: Sent server list packet with queue position [{}] displayed as population", 
+					direct_update->queue_position);
+			} else {
+				LogError("DEBUG: Failed to create server list packet for queued client");
+			}
+		}
+		
+		in_addr addr;
+		addr.s_addr = direct_update->ip_address;
+		LogInfo("DEBUG: Successfully updated client account [{}] with queue position [{}] (wait: {}s)", 
+			direct_update->ls_account_id, direct_update->queue_position, direct_update->estimated_wait);
+		
+		LogInfo("DEBUG: Custom server list packet sent to client - queue position should now be visible");
+	} else {
+		LogInfo("DEBUG: Client account [{}] not found - likely disconnected, cannot update queue position display", 
+			direct_update->ls_account_id);
+	}
+}
+
+void WorldServer::ProcessQueueAutoConnect(uint16_t opcode, const EQ::Net::Packet& p)
+{
+	if (p.Length() < sizeof(ServerQueueAutoConnect_Struct)) {
+		LogError("Received ServerOP_QueueAutoConnect packet that was too small");
+		return;
+	}
+
+	ServerQueueAutoConnect_Struct* sqac = (ServerQueueAutoConnect_Struct*)p.Data();
+	
+	LogInfo("Processing auto-connect for LS account [{}] from world server [{}]", 
+		sqac->loginserver_account_id, GetServerLongName());
+	
+	// Verify client is still connected to login server
+	Client* target_client = nullptr;
+	if (server.client_manager) {
+		target_client = server.client_manager->GetClient(sqac->loginserver_account_id);
+	}
+	
+	if (!target_client) {
+		LogInfo("Auto-connect failed: Client [{}] no longer connected to login server", 
+			sqac->loginserver_account_id);
+		return;
+	}
+	
+	// Use ServerManager to automatically send player to world server
+	if (server.server_manager) {
+		LogInfo("AUTO-CONNECT: Sending player [{}] (Client IP: {}) to world server [{}] automatically", 
+			sqac->loginserver_account_id, sqac->ip_addr_str, GetServerLongName());
+		
+		// Send user to THIS world server (the one that sent the auto-connect request)
+		// Use the world server's IP address, not the client's IP address
+		std::string world_server_ip = GetRemoteIP(); // This world server's IP
+		server.server_manager->SendUserToWorldRequest(
+			world_server_ip.c_str(),     // THIS world server's IP
+			sqac->loginserver_account_id, // Client account ID
+			sqac->ip_address,            // Client IP address
+			true                         // is_auto_connect = true
+		);
+		
+		LogInfo("Auto-connect request sent successfully for account [{}] to world server [{}]", 
+			sqac->loginserver_account_id, world_server_ip);
+	} else {
+		LogError("Auto-connect failed: ServerManager not available");
+	}
+}
+
+void WorldServer::ProcessWorldListUpdate(uint16_t opcode, const EQ::Net::Packet& p)
+{
+	LogDebug("Received ServerOP_WorldListUpdate - updating server list for all clients");
+	
+	// Send normal server list updates to all connected clients
+	if (server.client_manager) {
+		server.client_manager->UpdateServerList();
+		LogDebug("Updated server list for all connected clients");
+	} else {
+		LogError("Cannot update server list - ClientManager not available");
+	}
 }

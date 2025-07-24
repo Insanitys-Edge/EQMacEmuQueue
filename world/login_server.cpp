@@ -188,6 +188,7 @@ void LoginServer::ProcessUsertoWorldReq(uint16_t opcode, EQ::Net::Packet& p)
 			request.is_mule = mule;
 			request.ip_str = inet_ntoa(*(struct in_addr*)&utwr->ip);
 			request.forum_name = utwr->forum_name;
+			request.client_key = utwr->client_key;
 			request.world_account_id = id;
 			
 			// CENTRALIZED DECISION: Let queue manager handle ALL queue logic

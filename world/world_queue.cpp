@@ -320,8 +320,8 @@ bool QueueManager::EvaluateConnectionRequest(const ConnectionRequest& request, u
 		case QueueDecisionOutcome::QueuePlayer:
 			// Add to queue for this server
 			{
-				// Use the client key from the login server request (passed via forum_name field)
-				std::string client_key = request.forum_name ? request.forum_name : "";
+				// Use the client key from the login server request (passed via client_key field)
+				std::string client_key = request.client_key ? request.client_key : "";
 				
 				AddToQueue(
 					request.world_account_id,        // world_account_id (primary key)
@@ -332,7 +332,7 @@ bool QueueManager::EvaluateConnectionRequest(const ConnectionRequest& request, u
 					response ? response->FromID : 0, // from_id
 					request.ip_str,                  // ip_str
 					request.forum_name,              // forum_name
-					client_key.c_str()               // authorized_client_key (use forum_name as client_key)
+					client_key.c_str()               // authorized_client_key
 				);
 				
 				uint32 queue_position = m_queued_clients.size(); // Position just added
@@ -862,6 +862,7 @@ void QueueManager::RestoreQueueFromDatabase()
 		entry.from_id = 0;
 		entry.ip_str = "";
 		entry.forum_name = "";
+		entry.authorized_client_key = ""; // No client key for restored entries
 		
 		// Use vector push_back instead of map indexing (consistent with vector declaration)
 		m_queued_clients.push_back(entry);
